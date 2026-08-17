@@ -1,98 +1,242 @@
-# Code Package Overview
+# Data Distribution and Communication-Aware Optimisation in Distributed Deep Learning
 
-Experimental code for **Data Distribution and Communication-Aware Optimisation in Distributed Deep Learning**.
+This repository contains the implementation and experimental code for the MSc project **“Data Distribution and Communication-Aware Optimisation in Distributed Deep Learning.”**
 
-## Directory Structure
+The project investigates workload allocation for synchronous distributed deep learning on heterogeneous workers. It jointly models **computation throughput**, **data-transfer cost**, and **fixed per-worker latency**, and derives a closed-form allocation that minimises the predicted makespan by balancing worker completion times.
 
-```
-core/       Core algorithms (Python standard library only; can run directly on any machine)
-  closed_form_solver.py    Closed-form allocation algorithm (main contribution)
-  ga_verifier.py           Independent verification using a genetic algorithm
-  estimate_latency.py      Estimation of hidden latency using least-squares fitting
-  refine_loop.py           Iterative refinement loop
+The implementation was evaluated using CIFAR-10 and ResNet-18 on a heterogeneous three-worker GPU cluster.
 
-pipeline/   Code executed on the cluster (requires PyTorch + CUDA)
-  profile_100.py           Phase 1 small-sample profiling (100 images, repeated 3 times; median reported)
-  train_cifar.py           Single-node timed training; reports communication/computation time
-  train_fedavg.py          FedAvg local training step (non-overlapping partitions + weight saving)
-  aggregate.py             FedAvg weighted aggregation + test-set evaluation
-  stats3.py                Statistics for repeated experiments
-  run_strategies.sh        Driver for comparing multiple allocation strategies
-  repeat3.sh               Repeats each strategy 3 times
-  run_converge.sh          Driver for FedAvg convergence experiments
-```
+## Overview
 
-## Mapping to the Dissertation
+Equal data partitioning implicitly assumes that all workers have similar processing and communication characteristics. In a heterogeneous cluster, this can create a **straggler effect**, where faster workers finish early and remain idle while waiting for the slowest worker.
 
-| Dissertation Content | Code |
-|---|---|
-| Communication cost model | `node_time()` in `closed_form_solver.py` |
-| Closed-form derivation (Algorithm 1) | `closed_form_allocate()` in `closed_form_solver.py` |
-| Hidden latency estimation (Algorithm 2) | `estimate_latency.py` |
-| Iterative refinement (Algorithm 3) | `refine_loop.py` |
-| Two-phase workflow (Algorithm 4) | `profile_100.py` → `closed_form_solver.py` → `run_strategies.sh` |
-| GA verification (Algorithm 5) | `ga_verifier.py` |
-| Timing experiment results | `run_strategies.sh` + `repeat3.sh` + `stats3.py` |
-| FedAvg convergence results | `run_converge.sh` + `train_fedavg.py` + `aggregate.py` |
+This project compares three main allocation strategies:
 
-## Complete Experimental Workflow
+* **Equal** — the dataset is divided approximately equally among workers.
+* **Compute-only** — data is allocated in proportion to measured worker throughput.
+* **Joint communication-aware allocation** — computation throughput, transfer cost, and fixed latency are jointly considered.
 
-**Step 1 — Small-Sample Profiling**
+The proposed method follows a **measure-model-solve-refine** workflow:
 
-Run `profile_100.py` on each worker to obtain the median throughput. The measured results in this study were:
-736.0 / 741.8 / 1069.0 samples/s (RTX 4070 / RTX 3080 / RTX 5080)
+1. Profile worker performance using a small workload.
+2. Estimate communication parameters and compute throughput.
+3. Solve the workload allocation analytically.
+4. Apply the allocation to the full workload.
+5. Refine the allocation using observed full-load throughput.
+6. Validate both system performance and learning convergence.
 
-**Step 2 — Compute the Initial Allocation P0**
+## Repository Structure
 
-```
-python core/closed_form_solver.py 736.0 741.8 1069.0 0.3246 0.2500 0.4183 60000
-```
-This produces P0 = 29.03 / 29.34 / 41.63 %.
+The current public repository stores the implementation files at the repository root. Conceptually, the code is divided into **core optimisation components** and **experimental pipeline components**.
 
-**Step 3 — Apply the Allocation to the Full Dataset and Compare Against Baselines**
-
-```
-export CO1=0.2890 CO2=0.2913 CO3=0.4197
-export P01=0.2903 P02=0.2934 P03=0.4163
-bash pipeline/run_strategies.sh
+```text
+.
+├── closed_form_solver.py   # Closed-form workload allocation (Algorithm 1)
+├── estimate_latency.py     # Hidden latency estimation (Algorithm 2)
+├── refine_loop.py          # Iterative allocation refinement (Algorithm 3)
+├── ga_verifier.py          # Genetic-algorithm verification (Algorithm 5)
+│
+├── profile_100.py          # Small-sample worker profiling
+├── train_cifar.py          # Per-worker timing experiment
+├── train_fedavg.py         # FedAvg local training on disjoint shards
+├── aggregate.py            # Sample-weighted FedAvg aggregation and evaluation
+├── stats3.py               # Statistics for repeated timing experiments
+│
+├── run_strategies.sh       # Allocation-strategy comparison
+├── repeat3.sh              # Repeated timing experiments
+└── run_converge.sh         # FedAvg convergence experiments
 ```
 
-**Step 4 — Refinement**
+## Method
 
-From the logs generated in the previous step, calculate the observed throughput as `number of images / computation time` (941.5 / 1078.0 / 1716.7 samples/s).
-Re-solving the allocation problem gives P1 = 25.49 / 29.21 / 45.29 %.
+For worker (i), completion time is represented using an affine cost model combining fixed and data-dependent costs:
 
-**Step 5 — Repeat Experiments and Calculate Error Ranges**
-
-```
-bash pipeline/repeat3.sh && python pipeline/stats3.py
+```text
+T_i = L_i + d_i * (s / r_i + 1 / c_i)
 ```
 
-**Step 6 — Compare FedAvg Convergence**
+where:
 
+* `d_i` is the number of samples assigned to worker `i`,
+* `L_i` is its fixed communication/launch latency,
+* `s` is the payload size per sample,
+* `r_i` is its effective data-transfer rate,
+* `c_i` is its measured computation throughput.
+
+The optimisation problem is:
+
+```text
+minimise   max_i T_i
+subject to sum_i d_i = D
+           d_i >= 0
 ```
-bash pipeline/run_converge.sh JointP2 0.2733 0.2396 0.4871 10
-bash pipeline/run_converge.sh Equal   0.3333 0.3333 0.3334 10
+
+For active workers, the continuous optimum is obtained by equalising their predicted completion times.
+
+The resulting closed-form solver requires no numerical optimisation library and can be recomputed after new profiling or refinement measurements.
+
+## Experimental Environment
+
+The final experiments use the following three workers:
+
+| Worker   | GPU              | CPU Allocation | Fixed Latency |
+| -------- | ---------------- | -------------: | ------------: |
+| Worker 1 | GeForce RTX 4070 |       10 cores |      324.6 ms |
+| Worker 2 | GeForce RTX 3080 |       10 cores |      250.0 ms |
+| Worker 3 | GeForce RTX 5080 |       16 cores |      418.3 ms |
+
+The coordinator is responsible for allocation, remote execution, logging, and aggregation and is not included as a training worker in the optimisation.
+
+### Software
+
+* Python
+* PyTorch 2.7.0
+* CUDA 12.8
+* cuDNN 9
+* torchvision
+* Apptainer
+* CIFAR-10
+* ResNet-18
+
+The container image used in the experiments is:
+
+```text
+pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime
 ```
 
-## Environment
+The CUDA 12.8 / PyTorch 2.7 environment provides support for the RTX 5080 Blackwell `sm_120` architecture while remaining usable on the RTX 30- and 40-series workers.
 
-- **Container:** Apptainer, using an image based on `pytorch/pytorch:2.7.0-cuda12.8-cudnn9-runtime`
-  (The RTX 5080 uses the Blackwell `sm_120` architecture and therefore requires this version or newer.)
-- **CPU core restriction:** `taskset -c`
-- **Shared storage:** `/uolstore` network storage, accessible by all three workers and used for scripts and checkpoints
-- **Dataset:** CIFAR-10, with 50,000 training images and 10,000 test images
+## Reproducing the Experimental Workflow
 
-## Cluster Configuration
+### 1. Small-Sample Profiling
 
-The host addresses, container paths, and fixed latency values at the top of the driver scripts should be modified according to the target environment.
-The configuration used in this study was:
+Run `profile_100.py` on each worker.
 
-| Worker | GPU | CPU Cores | Fixed Latency |
-|---|---|---|---|
-| worker 1 | RTX 4070 | 10 | 324.6 ms |
-| worker 2 | RTX 3080 | 10 | 250.0 ms |
-| worker 3 | RTX 5080 | 16 | 418.3 ms |
+The measured median throughputs used for the initial allocation were:
 
-For the FedAvg experiments, the fixed latency also includes the per-round model-weight writing overhead
-(0.66 / 4.22 / 0.72 s), resulting in effective fixed latency values of 0.985 / 4.470 / 1.138 s.
+| GPU      |       Throughput |
+| -------- | ---------------: |
+| RTX 4070 |  736.0 samples/s |
+| RTX 3080 |  741.8 samples/s |
+| RTX 5080 | 1069.0 samples/s |
+
+### 2. Compute the Initial Allocation
+
+Run the closed-form solver using the measured throughput and latency parameters:
+
+```bash
+python closed_form_solver.py \
+    736.0 741.8 1069.0 \
+    0.3246 0.2500 0.4183 \
+    60000
+```
+
+This produces the initial profiling-based allocation.
+
+### 3. Compare Allocation Strategies
+
+Configure the required allocation ratios in the shell driver and run:
+
+```bash
+bash run_strategies.sh
+```
+
+The experiment compares:
+
+```text
+Equal
+Compute-only
+Joint
+```
+
+under the same model, dataset, preprocessing, CPU-affinity, and measurement configuration.
+
+### 4. Refine the Allocation
+
+Full-load execution provides more representative effective throughput measurements than the short profiling stage.
+
+`refine_loop.py` uses these measurements to re-estimate worker throughput and recompute the communication-aware allocation.
+
+The refinement step corrects systematic differences between small-sample profiling and full-load execution while retaining the same analytical allocation model.
+
+### 5. Repeated Timing Experiments
+
+Run each strategy repeatedly:
+
+```bash
+bash repeat3.sh
+python stats3.py
+```
+
+`stats3.py` reports summary statistics for the repeated makespan measurements.
+
+### 6. FedAvg Convergence Evaluation
+
+The convergence experiment uses genuine non-overlapping CIFAR-10 shards and sample-weighted aggregation.
+
+Example:
+
+```bash
+bash run_converge.sh JointP2 0.2733 0.2396 0.4871 10
+bash run_converge.sh Equal   0.3333 0.3333 0.3334 10
+```
+
+`train_fedavg.py` performs local training and writes worker checkpoints. `aggregate.py` combines the models using weights proportional to the number of samples represented by each worker and evaluates the resulting model on the CIFAR-10 test set.
+
+## Code-to-Method Mapping
+
+| Component                      | File                    | Responsibility                                                          |
+| ------------------------------ | ----------------------- | ----------------------------------------------------------------------- |
+| Closed-form allocation         | `closed_form_solver.py` | Algorithm 1; computes the common completion time and optimal allocation |
+| Hidden latency estimation      | `estimate_latency.py`   | Algorithm 2; transfer probing and least-squares latency estimation      |
+| Iterative refinement           | `refine_loop.py`        | Algorithm 3; updates throughput from representative measurements        |
+| Genetic-algorithm verification | `ga_verifier.py`        | Algorithm 5; independent numerical verification of the model optimum    |
+| Worker profiling               | `profile_100.py`        | Repeated 100-sample ResNet-18 profiling                                 |
+| Timing experiment              | `train_cifar.py`        | Per-worker training and model-based communication timing                |
+| Distributed learning           | `train_fedavg.py`       | Local training on non-overlapping CIFAR-10 shards                       |
+| Aggregation                    | `aggregate.py`          | Sample-weighted FedAvg and test-set evaluation                          |
+| Strategy orchestration         | `run_strategies.sh`     | Runs Equal, Compute-only and Joint strategies                           |
+| Repeated experiments           | `repeat3.sh`            | Repeats timing experiments                                              |
+| Statistics                     | `stats3.py`             | Summarises repeated timing measurements                                 |
+| Convergence evaluation         | `run_converge.sh`       | Coordinates multi-round FedAvg experiments                              |
+
+## Scope and Reproducibility Notes
+
+The implementation represents a controlled three-worker experimental system rather than a production distributed-training framework.
+
+The current timing experiments use independently measured worker execution times and modelled communication costs. The shell-based SSH orchestration does not provide simultaneous distributed timing of all workers, and the timing results therefore reconstruct the makespan from worker measurements.
+
+The FedAvg convergence experiment, in contrast, uses genuine non-overlapping data shards and sample-weighted model aggregation.
+
+Before running the code on another cluster, update:
+
+* worker host names,
+* container paths,
+* dataset paths,
+* CPU-affinity settings,
+* shared-storage paths,
+* communication latency parameters.
+
+The current scripts contain environment-specific configuration values and are therefore not intended to provide fully push-button reproduction on arbitrary hardware.
+
+## Dataset
+
+The experiments use **CIFAR-10**:
+
+* 50,000 training images
+* 10,000 test images
+
+The profiling, timing, and convergence experiments use **ResNet-18**.
+
+## Project Scope
+
+The project focuses on:
+
+* synchronous distributed training,
+* static heterogeneous workers,
+* computation and communication-aware data allocation,
+* minimisation of training makespan,
+* iterative allocation refinement,
+* and validation of learning convergence.
+
+Dynamic worker membership, non-IID allocation constraints, energy optimisation, and model/pipeline parallelism are outside the implemented scope.
